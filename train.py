@@ -17,6 +17,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 # --- CONFIGURATION ---
 MODEL_PATH = "./whisper-v3-large-local"  # Local model path
 DATASET_PATH = "./arabic_dataset_hf"     # Local dataset path
+TEXT_COLUMN = "sentence"                 # The column name containing the transcription
 OUTPUT_DIR = "./whisper-v3-arabic-lora-output"
 BATCH_SIZE = 32                          # Per-GPU batch size (L40S has 46GB VRAM)
 GRADIENT_ACCUMULATION = 1                # Increase if you face OOM
@@ -32,11 +33,18 @@ logger = logging.getLogger(__name__)
 def main():
     # 1. Load and Split Dataset
     logger.info("Loading dataset from disk...")
-    # load_from_disk uses memory mapping, 755GB RAM is plenty for 1.4M rows
     dataset = load_from_disk(DATASET_PATH)
     
+    # Debug: Print column names
+    if isinstance(dataset, dict) or hasattr(dataset, "keys"):
+        # If it's already a DatasetDict
+        cols = dataset[next(iter(dataset.keys()))].column_names
+    else:
+        cols = dataset.column_names
+    logger.info(f"Original columns: {cols}")
+
     logger.info("Splitting dataset into train/test...")
-    dataset = dataset.train_test_split(test_size=0.01, seed=42) # 1% test is ~14k samples, enough for eval
+    dataset = dataset.train_test_split(test_size=0.01, seed=42)
     
     # Ensure 16kHz
     logger.info("Casting audio column to 16kHz...")
@@ -46,7 +54,6 @@ def main():
     logger.info(f"Loading processor and model from {MODEL_PATH}...")
     processor = WhisperProcessor.from_pretrained(MODEL_PATH, language="Arabic", task="transcribe")
     
-    # L40S supports BF16 which is more stable than FP16
     model = WhisperForConditionalGeneration.from_pretrained(
         MODEL_PATH,
         torch_dtype=torch.bfloat16,
@@ -72,16 +79,21 @@ def main():
         audio = batch["audio"]
         batch["input_features"] = processor.feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
         # Tokenize target text
-        batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+        batch["labels"] = processor.tokenizer(batch[TEXT_COLUMN]).input_ids
         return batch
 
-    logger.info("Preprocessing dataset (mapping)...")
-    # Using num_proc for faster execution
+    logger.info("Cleaning up extra columns and preparing features...")
+    # Explicitly get the list of columns to remove (everything except what we add in map)
+    column_names = dataset["train"].column_names
+    
     dataset = dataset.map(
         prepare_dataset, 
-        remove_columns=dataset.column_names["train"], 
-        num_proc=NUM_PROC
+        remove_columns=column_names, 
+        num_proc=NUM_PROC,
+        desc="Processing dataset"
     )
+
+    logger.info(f"Final dataset features: {dataset['train'].features}")
 
     # 5. Data Collator
     @dataclass
@@ -95,7 +107,6 @@ def main():
             label_features = [{"input_ids": feature["labels"]} for feature in features]
             labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
 
-            # Replace padding with -100 to ignore loss
             labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
             batch["labels"] = labels
             return batch
@@ -111,7 +122,7 @@ def main():
         warmup_steps=WARMUP_STEPS,
         max_steps=MAX_STEPS,
         gradient_checkpointing=True,
-        bf16=True,               # Use BF16 for L40S
+        bf16=True,
         evaluation_strategy="steps",
         per_device_eval_batch_size=BATCH_SIZE,
         predict_with_generate=True,
@@ -125,7 +136,7 @@ def main():
         greater_is_better=False,
         push_to_hub=False,
         remove_unused_columns=False,
-        dataloader_num_workers=8, # Faster data loading
+        dataloader_num_workers=8,
     )
 
     # 7. Start Training
