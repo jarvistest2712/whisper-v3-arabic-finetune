@@ -16,42 +16,45 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 # --- CONFIGURATION ---
 MODEL_PATH = "./whisper-v3-large-local"  # Local model path
-DATASET_PATH = "./arabic_dataset_hf"     # Local dataset path
-TEXT_COLUMN = "text"                     # UPDATED: Matches user's finding
+DATASET_PATH = "./arabic_dataset_hf"     # Local dataset path (merged output)
 OUTPUT_DIR = "./whisper-v3-arabic-lora-output"
-BATCH_SIZE = 32                          # Per-GPU batch size (L40S has 46GB VRAM)
-GRADIENT_ACCUMULATION = 1                # Increase if you face OOM
+BATCH_SIZE = 32                          # Per-GPU batch size
+GRADIENT_ACCUMULATION = 1                
 LEARNING_RATE = 1e-4
-MAX_STEPS = 100000                       # Total training steps
+MAX_STEPS = 100000                       
 WARMUP_STEPS = 1000
-NUM_PROC = 16                            # Multiprocessing for data preparation
+NUM_PROC = 16                            
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def main():
-    # 1. Load and Split Dataset
-    logger.info("Loading dataset from disk...")
+    # 1. Load Dataset
+    logger.info(f"Loading dataset from {DATASET_PATH}...")
     dataset = load_from_disk(DATASET_PATH)
     
-    # Debug: Print column names
-    if isinstance(dataset, dict) or hasattr(dataset, "keys"):
-        # If it's already a DatasetDict
-        cols = dataset[next(iter(dataset.keys()))].column_names
-    else:
-        cols = dataset.column_names
-    logger.info(f"Original columns: {cols}")
+    # 2. Cleanup Extra Columns (Important for Merger compatibility)
+    # The merger script adds 'metadata', 'audio', and 'text'. 
+    # We must keep only 'audio' and 'text' for the prepare_dataset phase.
+    # Everything else (like metadata) must go now to prevent trainer errors.
+    initial_cols = dataset.column_names if not hasattr(dataset, "keys") else dataset[next(iter(dataset.keys()))].column_names
+    logger.info(f"Detected columns: {initial_cols}")
+    
+    cols_to_drop = [c for c in initial_cols if c not in ["audio", "text"]]
+    if cols_to_drop:
+        logger.info(f"Removing non-essential columns: {cols_to_drop}")
+        dataset = dataset.remove_columns(cols_to_drop)
 
-    logger.info("Splitting dataset into train/test...")
+    # 3. Train/Test Split
+    logger.info("Splitting dataset...")
     dataset = dataset.train_test_split(test_size=0.01, seed=42)
     
     # Ensure 16kHz
-    logger.info("Casting audio column to 16kHz...")
     dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 
-    # 2. Load Processor and Model
-    logger.info(f"Loading processor and model from {MODEL_PATH}...")
+    # 4. Load Processor and Model
+    logger.info("Loading Whisper assets...")
     processor = WhisperProcessor.from_pretrained(MODEL_PATH, language="Arabic", task="transcribe")
     
     model = WhisperForConditionalGeneration.from_pretrained(
@@ -61,7 +64,7 @@ def main():
         device_map="auto"
     )
 
-    # 3. PEFT/LoRA Setup
+    # 5. PEFT/LoRA Setup
     model = prepare_model_for_kbit_training(model)
     config = LoraConfig(
         r=32,
@@ -71,57 +74,45 @@ def main():
         bias="none"
     )
     model = get_peft_model(model, config)
-    model.print_trainable_parameters()
 
-    # 4. Data Preparation
+    # 6. Data Preparation (Strict Cleaning)
     def prepare_dataset(batch):
-        # Ses verisini işle (input_features oluştur)
         audio = batch["audio"]
+        # Create input_features
         batch["input_features"] = processor.feature_extractor(
             audio["array"], 
             sampling_rate=audio["sampling_rate"]
         ).input_features[0]
-        
-        # Metni tokenize et (labels oluştur) - User Finding: batch["text"]
-        batch["labels"] = processor.tokenizer(batch[TEXT_COLUMN]).input_ids
+        # Create labels from the 'text' column produced by the merger
+        batch["labels"] = processor.tokenizer(batch["text"]).input_ids
         return batch
 
-    logger.info("Gereksiz kolonlar temizleniyor ve veri hazırlanıyor...")
-    
-    # Mevcut tüm kolonları alalım ki silerken hata oluşmasın
-    # 'train' veya 'test' splitlerinden birinin kolonlarını baz alıyoruz
-    all_current_cols = dataset["train"].column_names
-    logger.info(f"Silinecek kolonlar: {all_current_cols}")
-
+    logger.info("Converting audio to features and tokenizing text...")
+    # remove_columns here ensures only 'input_features' and 'labels' remain
     dataset = dataset.map(
         prepare_dataset, 
-        remove_columns=all_current_cols, 
+        remove_columns=dataset["train"].column_names, 
         num_proc=NUM_PROC,
         load_from_cache_file=False,
-        desc="Processing and cleaning dataset"
+        desc="Final feature extraction"
     )
 
-    logger.info(f"Final dataset features: {dataset['train'].features}")
-
-    # 5. Data Collator
+    # 7. Data Collator
     @dataclass
     class DataCollatorSpeechSeq2SeqWithPadding:
         processor: Any
-
         def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
             input_features = [{"input_features": feature["input_features"]} for feature in features]
             batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
-
             label_features = [{"input_ids": feature["labels"]} for feature in features]
             labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-
             labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
             batch["labels"] = labels
             return batch
 
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
 
-    # 6. Training Arguments
+    # 8. Training Arguments
     training_args = Seq2SeqTrainingArguments(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=BATCH_SIZE,
@@ -147,7 +138,7 @@ def main():
         dataloader_num_workers=8,
     )
 
-    # 7. Start Training
+    # 9. Start Training
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
@@ -157,7 +148,7 @@ def main():
         tokenizer=processor.feature_extractor,
     )
 
-    logger.info("Starting training session...")
+    logger.info("All systems nominal. Starting training...")
     trainer.train()
 
 if __name__ == "__main__":
