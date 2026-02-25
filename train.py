@@ -11,10 +11,10 @@ from transformers import (
     Seq2SeqTrainer
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from accelerate import PartialState
 
 # --- CONFIGURATION (ULTRA-SLIM VERSION) ---
 MODEL_PATH = "./whisper-v3-large-local"  # Local model path
-# Path to your PRE-PROCESSED dataset (the one with input_features and labels)
 DATASET_PATH = "./merged_whisper_dataset_processed_448" 
 OUTPUT_DIR = "./whisper-v3-arabic-lora-output"
 BATCH_SIZE = 32                          # Per-GPU batch size
@@ -29,12 +29,10 @@ logger = logging.getLogger(__name__)
 
 def main():
     # 1. Load Pre-processed Dataset
-    # Since you already did map/filter/remove_columns, we just load it.
     logger.info(f"Loading pre-processed dataset from {DATASET_PATH}...")
     dataset = load_from_disk(DATASET_PATH)
     
     logger.info(f"Dataset columns: {dataset.column_names}")
-    # Expected columns: ['input_features', 'labels']
 
     logger.info("Splitting dataset into train/test...")
     dataset = dataset.train_test_split(test_size=0.01, seed=42)
@@ -43,11 +41,15 @@ def main():
     logger.info("Loading Whisper assets...")
     processor = WhisperProcessor.from_pretrained(MODEL_PATH, language="Arabic", task="transcribe")
     
+    # Distributed training fix: Use PartialState to get current device index
+    device_string = PartialState().process_index
+    
     model = WhisperForConditionalGeneration.from_pretrained(
         MODEL_PATH,
         torch_dtype=torch.bfloat16,
         load_in_8bit=True,
-        device_map="auto"
+        # device_map="auto" is NOT allowed in distributed training
+        device_map={"": device_string} 
     )
 
     # 3. PEFT/LoRA Setup
@@ -62,20 +64,17 @@ def main():
     model = get_peft_model(model, config)
     model.print_trainable_parameters()
 
-    # 4. Data Collator (Simplified for pre-processed data)
+    # 4. Data Collator
     @dataclass
     class DataCollatorSpeechSeq2SeqWithPadding:
         processor: Any
         def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-            # The inputs are already spectrograms (input_features)
             input_features = [{"input_features": feature["input_features"]} for feature in features]
             batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
 
-            # The labels are already token IDs
             label_features = [{"input_ids": feature["labels"]} for feature in features]
             labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
 
-            # Replace padding with -100 to ignore loss
             labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
             batch["labels"] = labels
             return batch
@@ -106,6 +105,7 @@ def main():
         push_to_hub=False,
         remove_unused_columns=False,
         dataloader_num_workers=8,
+        ddp_find_unused_parameters=False, # Optimization for DDP
     )
 
     # 6. Start Training
@@ -118,7 +118,7 @@ def main():
         tokenizer=processor.feature_extractor,
     )
 
-    logger.info("Starting ultra-fast training (no preprocessing needed)...")
+    logger.info("Starting distributed training...")
     trainer.train()
 
 if __name__ == "__main__":
