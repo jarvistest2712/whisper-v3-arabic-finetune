@@ -12,23 +12,32 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from accelerate import PartialState
+import accelerate.utils
 
-# --- CONFIGURATION ---
-MODEL_PATH = "./whisper-v3-large-local"
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- CRITICAL VERSION COMPATIBILITY PATCH ---
+# For PyTorch 2.10+ and latest Accelerate versions
+if not hasattr(accelerate.utils, "clear_device_cache"):
+    logger.info("Applying Patch: accelerate.utils.clear_device_cache -> torch.cuda.empty_cache")
+    accelerate.utils.clear_device_cache = lambda: torch.cuda.empty_cache()
+# --------------------------------------------
+
+# --- CONFIGURATION (ULTRA-SLIM VERSION) ---
+MODEL_PATH = "./whisper-v3-large-local"  # Local model path
 DATASET_PATH = "./merged_whisper_dataset_processed_448" 
 OUTPUT_DIR = "./whisper-v3-arabic-lora-output"
-BATCH_SIZE = 32
+BATCH_SIZE = 32                          # Per-GPU batch size
 GRADIENT_ACCUMULATION = 1                
 LEARNING_RATE = 1e-4
 MAX_STEPS = 100000                       
 WARMUP_STEPS = 1000
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 def main():
     # 1. Load Pre-processed Dataset
-    logger.info(f"Loading dataset from {DATASET_PATH}...")
+    logger.info(f"Loading pre-processed dataset from {DATASET_PATH}...")
     dataset = load_from_disk(DATASET_PATH)
     dataset = dataset.train_test_split(test_size=0.01, seed=42)
 
@@ -51,8 +60,11 @@ def main():
     # 3. PEFT/LoRA Setup
     model = prepare_model_for_kbit_training(model)
     
-    # Explicitly enable input gradients
+    # Explicitly enable input gradients for quantized training
     model.enable_input_require_grads()
+
+    # Enable modern gradient checkpointing to avoid MatmulState AttributeError
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     config = LoraConfig(
         r=32,
@@ -62,8 +74,6 @@ def main():
         bias="none"
     )
     model = get_peft_model(model, config)
-    
-    # Verify trainable parameters
     model.print_trainable_parameters()
 
     # 4. Data Collator
@@ -71,15 +81,10 @@ def main():
     class DataCollatorSpeechSeq2SeqWithPadding:
         processor: Any
         def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-            # The inputs are already spectrograms (input_features)
             input_features = [{"input_features": feature["input_features"]} for feature in features]
             batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
-
-            # The labels are already token IDs
             label_features = [{"input_ids": feature["labels"]} for feature in features]
             labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-
-            # Replace padding with -100 to ignore loss
             labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
             batch["labels"] = labels
             return batch
@@ -123,7 +128,7 @@ def main():
         tokenizer=processor.feature_extractor,
     )
 
-    logger.info("Starting training with gradients enabled...")
+    logger.info("Starting training with all fixes (Gradients, Reentrant, Cache, and Cache-Clear)...")
     trainer.train()
 
 if __name__ == "__main__":
