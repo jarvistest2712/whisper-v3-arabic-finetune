@@ -17,7 +17,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 # --- CONFIGURATION ---
 MODEL_PATH = "./whisper-v3-large-local"  # Local model path
 DATASET_PATH = "./arabic_dataset_hf"     # Local dataset path
-TEXT_COLUMN = "sentence"                 # The column name containing the transcription
+TEXT_COLUMN = "text"                     # UPDATED: Matches user's finding
 OUTPUT_DIR = "./whisper-v3-arabic-lora-output"
 BATCH_SIZE = 32                          # Per-GPU batch size (L40S has 46GB VRAM)
 GRADIENT_ACCUMULATION = 1                # Increase if you face OOM
@@ -75,22 +75,30 @@ def main():
 
     # 4. Data Preparation
     def prepare_dataset(batch):
-        # Transcribe audio to input features
+        # Ses verisini işle (input_features oluştur)
         audio = batch["audio"]
-        batch["input_features"] = processor.feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
-        # Tokenize target text
+        batch["input_features"] = processor.feature_extractor(
+            audio["array"], 
+            sampling_rate=audio["sampling_rate"]
+        ).input_features[0]
+        
+        # Metni tokenize et (labels oluştur) - User Finding: batch["text"]
         batch["labels"] = processor.tokenizer(batch[TEXT_COLUMN]).input_ids
         return batch
 
-    logger.info("Cleaning up extra columns and preparing features...")
-    # Explicitly get the list of columns to remove (everything except what we add in map)
-    column_names = dataset["train"].column_names
+    logger.info("Gereksiz kolonlar temizleniyor ve veri hazırlanıyor...")
     
+    # Mevcut tüm kolonları alalım ki silerken hata oluşmasın
+    # 'train' veya 'test' splitlerinden birinin kolonlarını baz alıyoruz
+    all_current_cols = dataset["train"].column_names
+    logger.info(f"Silinecek kolonlar: {all_current_cols}")
+
     dataset = dataset.map(
         prepare_dataset, 
-        remove_columns=column_names, 
+        remove_columns=all_current_cols, 
         num_proc=NUM_PROC,
-        desc="Processing dataset"
+        load_from_cache_file=False,
+        desc="Processing and cleaning dataset"
     )
 
     logger.info(f"Final dataset features: {dataset['train'].features}")
