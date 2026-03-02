@@ -23,11 +23,11 @@ def normalize_arabic(text):
     if not text: return ""
     # Remove diacritics
     text = re.sub(r"[\u064B-\u0652]", "", text)
-    # Standardize Alifs (أ، إ، آ -> ا)
+    # Standardize Alifs
     text = re.sub(r"[أإآ]", "ا", text)
-    # Standardize Yaa (ى -> ي)
+    # Standardize Yaa
     text = re.sub(r"ى", "ي", text)
-    # Standardize Te Marbuta (ة -> ه)
+    # Standardize Te Marbuta
     text = re.sub(r"ة", "ه", text)
     # Clean redundant whitespace
     text = re.sub(r"\s+", " ", text).strip()
@@ -35,14 +35,10 @@ def normalize_arabic(text):
 
 def main():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    torch_dtype = torch.float16 # Using FP16 for better stability during inference on L40S
+    torch_dtype = torch.float16
 
     # 2. Load Model and Processor
     logger.info("Loading base model...")
-    if not os.path.exists(BASE_MODEL):
-        logger.error(f"Base model not found at {BASE_MODEL}")
-        return
-
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         BASE_MODEL, 
         torch_dtype=torch_dtype, 
@@ -50,22 +46,17 @@ def main():
     )
 
     logger.info(f"Merging LoRA Adapter from: {CHECKPOINT}")
-    if not os.path.exists(CHECKPOINT):
-        logger.error(f"Checkpoint not found at {CHECKPOINT}")
-        return
-        
-    # Crucial for preventing 'vectorized_gather_kernel' index errors:
     model = PeftModel.from_pretrained(model, CHECKPOINT)
     model = model.merge_and_unload() 
     model.to(device)
     model.eval()
 
-    processor = AutoProcessor.from_pretrained(BASE_MODEL)
+    # Load processor with explicit language and task
+    processor = AutoProcessor.from_pretrained(BASE_MODEL, language="Arabic", task="transcribe")
 
     # 3. Load Test Data
     logger.info("Loading dataset...")
     dataset = load_from_disk(DATASET_PATH)
-
     if isinstance(dataset, dict) or hasattr(dataset, "keys"):
         test_data = dataset["test"] if "test" in dataset else dataset[next(iter(dataset.keys()))]
     else:
@@ -73,14 +64,18 @@ def main():
 
     test_data = test_data.select(range(min(SAMPLE_COUNT, len(test_data))))
 
-    # 4. Preparation for Generation
-    # Force Arabic language IDs to prevent cross-language index errors
-    forced_decoder_ids = processor.get_forced_decoder_ids(language="arabic", task="transcribe")
+    # 4. Preparation for Generation (Robust Method)
+    # Using get_decoder_prompt_ids which is the most stable across Whisper versions
+    try:
+        forced_decoder_ids = processor.get_decoder_prompt_ids(language="arabic", task="transcribe")
+    except Exception as e:
+        logger.warning(f"Could not get decoder prompt IDs: {e}. Proceeding without them.")
+        forced_decoder_ids = None
 
     references = []
     predictions = []
 
-    print(f"\n{'='*20} ARABIC WER EVALUATION (ROBUST MODE) {'='*20}\n")
+    print(f"\n{'='*20} ARABIC WER EVALUATION (STABLE MODE) {'='*20}\n")
 
     for i, row in enumerate(tqdm(test_data)):
         try:
@@ -89,7 +84,7 @@ def main():
             input_features = processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features
             input_features = input_features.to(device).to(torch_dtype)
 
-            # 5. Manual Generation (More stable than pipeline for Whisper v3)
+            # 5. Manual Generation with explicit IDs
             with torch.no_grad():
                 predicted_ids = model.generate(
                     input_features,
@@ -97,7 +92,7 @@ def main():
                     max_new_tokens=225,
                     num_beams=1,
                     use_cache=True,
-                    return_timestamps=False # CRITICAL: Disabling this fixes the gather kernel error
+                    return_timestamps=False
                 )
             
             transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
@@ -121,16 +116,12 @@ def main():
             continue
 
     # 6. Final Report
-    if not references:
-        logger.error("No samples were successfully processed.")
-        return
-
-    final_wer = 100 * wer(references, predictions)
-    
-    print(f"\n{'='*50}")
-    print(f"TOTAL SAMPLES PROCESSED: {len(references)}")
-    print(f"FINAL WORD ERROR RATE (WER): %{final_wer:.2f}")
-    print(f"{'='*50}")
+    if references:
+        final_wer = 100 * wer(references, predictions)
+        print(f"\n{'='*50}")
+        print(f"TOTAL SAMPLES PROCESSED: {len(references)}")
+        print(f"FINAL WORD ERROR RATE (WER): %{final_wer:.2f}")
+        print(f"{'='*50}")
 
 if __name__ == "__main__":
     main()
